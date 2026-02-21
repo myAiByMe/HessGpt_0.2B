@@ -1,0 +1,524 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    🚀 HessGPT DUAL MODEL - TRAINING ROADMAP
+                  (Model 0.5B Factual + Model 0.3B Code + Router)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+📋 VUE D'ENSEMBLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ARCHITECTURE FINALE:
+┌────────────────────────────────────────────────────────────────────────────┐
+│                                                                            │
+│  USER INPUT                                                                │
+│      ↓                                                                     │
+│  Model 1 (0.5B - Factual/Assistant)                                       │
+│      ↓                                                                     │
+│  Détecte besoin de code/math ?                                            │
+│      ├─ NON → Réponse directe                                             │
+│      └─ OUI → Génère <|code|>prompt<|end|>                                │
+│                ↓                                                           │
+│            ROUTER (script Python)                                          │
+│                ↓                                                           │
+│            Model 2 (0.3B - Code Specialist)                                │
+│                ↓                                                           │
+│            Python Sandbox (exécution sécurisée)                            │
+│                ↓                                                           │
+│            Résultat → Router → Model 1                                     │
+│                ↓                                                           │
+│            Réponse finale intégrée                                         │
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
+
+
+TOKENS SPÉCIAUX:
+────────────────────────────────────────────────────────────────────────────────
+<|code|>    (32004)  - Demande d'exécution de code/math/logic
+<|end|>     (32003)  - Fin du bloc
+<|result|>  (32007)  - Résultat du Model 2 (optionnel)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 1: TRAINING MODEL 1 (0.5B - FACTUAL/ASSISTANT)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ÉTAPE 1.1: PRE-TRAIN (10B tokens, 0% code/math)
+────────────────────────────────────────────────────────────────────────────────
+Dataset:
+  - DCLM (25%)
+  - RefinedWeb (15%)
+  - FineWeb-Edu PDF (20%)
+  - FineWeb-Edu (10%)
+  - Cosmopedia v2 (20%)
+  - Wikipedia (10%)
+
+Commande:
+  python download_ultra_filtered_mistral.py
+  python pretrain_hessgpt_mistral.py
+
+Output:
+  ./checkpoints/HessGpt_pretrain.pt (Model 1 pre-trained)
+
+Durée:
+  ~5 jours (12h GPU × 10 chunks)
+
+
+ÉTAPE 1.2: SFT LoRA #1 (Conversational)
+────────────────────────────────────────────────────────────────────────────────
+Dataset:
+  - SmolTalk (70k)
+  - WikiHow (20k)
+  - Tulu 3 Personas (30k)
+  - LongAlign (10k)
+  Total: 130k samples
+
+Commande:
+  python sft_hessgpt_mistral_lora.py \
+    --pretrain-checkpoint ./checkpoints/HessGpt_pretrain.pt \
+    --output-checkpoint ./checkpoints/HessGpt_sft1_lora.pt
+
+Output:
+  ./checkpoints/HessGpt_sft1_lora.pt (LoRA weights)
+
+Durée:
+  ~12h (1 session GPU)
+
+
+ÉTAPE 1.3: MERGE LoRA #1
+────────────────────────────────────────────────────────────────────────────────
+Objectif: Fusionner LoRA dans le modèle de base
+
+Script à créer: merge_lora.py
+
+Commande:
+  python merge_lora.py \
+    --base-model ./checkpoints/HessGpt_pretrain.pt \
+    --lora-weights ./checkpoints/HessGpt_sft1_lora.pt \
+    --output ./checkpoints/HessGpt_sft1_merged.pt
+
+Output:
+  ./checkpoints/HessGpt_sft1_merged.pt (Model 1 conversational)
+
+Durée:
+  ~5-10 min (CPU)
+
+
+ÉTAPE 1.4: SFT LoRA #2 (Routing Training) ⚡ CRITIQUE
+────────────────────────────────────────────────────────────────────────────────
+Objectif: Apprendre au Model 1 à générer <|code|> quand nécessaire
+
+Dataset spécial (20k samples):
+  Format:
+    {
+      "messages": [
+        {"role": "user", "content": "Calcule 2+2"},
+        {"role": "assistant", "content": "<|code|>\nprint(2+2)\n<|end|>\nLe résultat est 4."}
+      ]
+    }
+
+Exemples:
+  - User: "Quelle est la dérivée de x²?"
+    Assistant: "<|code|>\nimport sympy as sp\nx = sp.Symbol('x')\nsp.diff(x**2, x)\n<|end|>\nLa dérivée est 2x."
+  
+  - User: "Écris une fonction Fibonacci"
+    Assistant: "<|code|>\ndef fibonacci(n):\n    if n <= 1:\n        return n\n    return fibonacci(n-1) + fibonacci(n-2)\n<|end|>\nVoici la fonction."
+
+Génération dataset:
+  → Utilise une IA (GPT-4, Claude) pour générer 20k exemples
+  → Format: questions qui nécessitent code → réponses avec <|code|>
+
+Commande:
+  python sft_hessgpt_mistral_lora.py \
+    --pretrain-checkpoint ./checkpoints/HessGpt_sft1_merged.pt \
+    --output-checkpoint ./checkpoints/HessGpt_routing_lora.pt \
+    --dataset ./data/routing_dataset_20k.json
+
+Output:
+  ./checkpoints/HessGpt_routing_lora.pt (LoRA routing)
+
+Durée:
+  ~2-3h
+
+
+ÉTAPE 1.5: MERGE LoRA #2
+────────────────────────────────────────────────────────────────────────────────
+Commande:
+  python merge_lora.py \
+    --base-model ./checkpoints/HessGpt_sft1_merged.pt \
+    --lora-weights ./checkpoints/HessGpt_routing_lora.pt \
+    --output ./checkpoints/HessGpt_model1_final.pt
+
+Output:
+  ./checkpoints/HessGpt_model1_final.pt ✅ MODEL 1 FINAL
+
+Durée:
+  ~5-10 min
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 2: TRAINING MODEL 2 (0.3B - CODE SPECIALIST)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ÉTAPE 2.1: CRÉER CONFIG MODEL 2
+────────────────────────────────────────────────────────────────────────────────
+Config HessGPT 0.3B:
+  {
+    'vocab_size': 32008,
+    'embed_dim': 896,      # Réduit (vs 1280)
+    'num_heads': 14,       # Réduit (vs 20)
+    'num_layers': 16,      # Réduit (vs 22)
+    'max_seq_len': 2048,   # Plus court (code < conversational)
+    'n_kv_heads': 2,       # Ratio 7:1 (vs 4:1)
+    ...
+  }
+
+Total params: ~300M
+
+
+ÉTAPE 2.2: PRE-TRAIN MODEL 2 (Code datasets)
+────────────────────────────────────────────────────────────────────────────────
+Dataset code (5-7B tokens):
+  - The Stack (Python filtered): 50-60%
+  - The Stack (JavaScript): 20-25%
+  - The Stack (HTML): 10-12%
+  - The Stack (CSS): 8-10%
+
+Filtres:
+  ✅ Code fonctionnel (pas de snippets cassés)
+  ✅ Commenté
+  ✅ Pas de malware
+  ✅ Tests inclus (si possible)
+
+Script à créer: download_code_dataset.py
+
+Commande:
+  python download_code_dataset.py --output ./data/code_filtered
+  python pretrain_hessgpt_mistral.py \
+    --config ./configs/model2_config.json \
+    --data-dir ./data/code_filtered \
+    --output ./checkpoints/HessGpt_model2_pretrain.pt
+
+Durée:
+  ~3-4 jours (moins de chunks, model plus petit)
+
+
+ÉTAPE 2.3: SFT MODEL 2 (Code instruction)
+────────────────────────────────────────────────────────────────────────────────
+Dataset:
+  - Code Alpaca (Python, JS, HTML, CSS)
+  - CodeContests
+  - APPS (code problems)
+  Total: ~50k samples
+
+Format:
+  {
+    "instruction": "Write a function to reverse a string",
+    "output": "def reverse_string(s):\n    return s[::-1]"
+  }
+
+Commande:
+  python sft_hessgpt_mistral_lora.py \
+    --pretrain-checkpoint ./checkpoints/HessGpt_model2_pretrain.pt \
+    --output-checkpoint ./checkpoints/HessGpt_model2_sft_lora.pt \
+    --dataset ./data/code_instruction_50k.json
+
+Durée:
+  ~6-8h
+
+
+ÉTAPE 2.4: MERGE MODEL 2
+────────────────────────────────────────────────────────────────────────────────
+Commande:
+  python merge_lora.py \
+    --base-model ./checkpoints/HessGpt_model2_pretrain.pt \
+    --lora-weights ./checkpoints/HessGpt_model2_sft_lora.pt \
+    --output ./checkpoints/HessGpt_model2_final.pt
+
+Output:
+  ./checkpoints/HessGpt_model2_final.pt ✅ MODEL 2 FINAL
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 3: ROUTER + PYTHON SANDBOX
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ÉTAPE 3.1: CRÉER PYTHON SANDBOX
+────────────────────────────────────────────────────────────────────────────────
+Objectif: Exécuter code Python de façon sécurisée
+
+Options:
+  1. RestrictedPython (simple, limité)
+  2. Docker container (sécurisé, overhead)
+  3. PyPy sandbox (équilibre)
+
+Script à créer: sandbox.py
+
+Fonctionnalités:
+  - Timeout (5 sec max)
+  - Limite mémoire (100 MB)
+  - Pas d'accès filesystem
+  - Pas d'imports dangereux (os, subprocess, etc.)
+  - Whitelist: math, numpy, sympy (calculs)
+
+Exemple:
+  result = sandbox.execute("""
+  import math
+  print(math.sqrt(16))
+  """)
+  # Output: "4.0"
+
+
+ÉTAPE 3.2: CRÉER ROUTER
+────────────────────────────────────────────────────────────────────────────────
+Script: router.py
+
+Workflow:
+  1. User input → Model 1
+  2. Model 1 génère réponse
+  3. Router détecte <|code|> ?
+     - NON → Retourne réponse Model 1
+     - OUI → Extract code → Model 2 → Sandbox → Inject résultat → Retourne
+  
+Pseudo-code:
+  def route(user_input):
+      # Generate avec Model 1
+      response1 = model1.generate(user_input)
+      
+      # Check for <|code|> token
+      if '<|code|>' in response1:
+          # Extract code block
+          code = extract_between('<|code|>', '<|end|>', response1)
+          
+          # Send to Model 2 for refinement (optionnel)
+          code_refined = model2.generate(code)
+          
+          # Execute in sandbox
+          result = sandbox.execute(code_refined)
+          
+          # Inject result
+          final = response1.replace(
+              f'<|code|>{code}<|end|>',
+              f'<|code|>{code}<|end|>\nRésultat: {result}'
+          )
+          return final
+      else:
+          return response1
+
+
+ÉTAPE 3.3: INFERENCE SCRIPT
+────────────────────────────────────────────────────────────────────────────────
+Script: inference.py
+
+Usage:
+  python inference.py \
+    --model1 ./checkpoints/HessGpt_model1_final.pt \
+    --model2 ./checkpoints/HessGpt_model2_final.pt \
+    --prompt "Calcule la racine carrée de 144"
+
+Output:
+  Model 1: "<|code|>\nimport math\nprint(math.sqrt(144))\n<|end|>"
+  Router: Détecte <|code|>
+  Sandbox: Exécute → "12.0"
+  Final: "La racine carrée de 144 est 12.0"
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 4: DATASET ROUTING (20K SAMPLES)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FORMAT DATASET:
+────────────────────────────────────────────────────────────────────────────────
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "Calcule 15 * 23"
+    },
+    {
+      "role": "assistant",
+      "content": "<|code|>\nresult = 15 * 23\nprint(result)\n<|end|>\nLe résultat est 345."
+    }
+  ]
+}
+
+
+CATÉGORIES (20k samples):
+────────────────────────────────────────────────────────────────────────────────
+1. Calculs mathématiques (5k)
+   - Arithmétique simple
+   - Équations
+   - Dérivées, intégrales (avec sympy)
+   - Statistiques
+
+2. Algorithmes Python (5k)
+   - Tri, recherche
+   - Fibonacci, factorielle
+   - Manipulation strings
+   - Data structures
+
+3. Web (HTML/CSS/JS) (5k)
+   - Génération HTML
+   - Styles CSS
+   - Fonctions JavaScript simples
+
+4. Data processing (5k)
+   - Listes, dictionnaires
+   - Parsing JSON
+   - Calculs sur arrays
+
+
+PROMPT POUR GÉNÉRATION (GPT-4/Claude):
+────────────────────────────────────────────────────────────────────────────────
+Génère 20,000 exemples de conversations où un assistant doit utiliser du code
+pour répondre à l'utilisateur.
+
+Format de chaque exemple:
+{
+  "messages": [
+    {"role": "user", "content": "<question>"},
+    {"role": "assistant", "content": "<|code|>\n<code python>\n<|end|>\n<explication>"}
+  ]
+}
+
+Catégories:
+- 25% calculs mathématiques
+- 25% algorithmes Python
+- 25% web (HTML/CSS/JS)
+- 25% data processing
+
+Exemples:
+- User: "Calcule 2^10"
+  Assistant: "<|code|>\nresult = 2**10\nprint(result)\n<|end|>\n2 puissance 10 égale 1024."
+
+- User: "Crée un bouton rouge en HTML"
+  Assistant: "<|code|>\n<button style='background-color: red;'>Cliquez ici</button>\n<|end|>\nVoici un bouton rouge."
+
+Génère les 20,000 exemples au format JSON.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TIMELINE COMPLET
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Phase 1: Model 1 (0.5B Factual)
+├─ Pretrain:           5 jours  (60h GPU)
+├─ SFT #1:             12h GPU
+├─ Merge #1:           10 min CPU
+├─ SFT #2 (routing):   3h GPU
+└─ Merge #2:           10 min CPU
+   Total:              ~5.7 jours GPU
+
+Phase 2: Model 2 (0.3B Code)
+├─ Pretrain:           3-4 jours (36-48h GPU)
+├─ SFT:                8h GPU
+└─ Merge:              10 min CPU
+   Total:              ~4 jours GPU
+
+Phase 3: Router + Sandbox
+├─ Sandbox:            2-3h dev
+├─ Router:             3-4h dev
+└─ Testing:            2-3h
+   Total:              1 jour dev
+
+TOTAL PROJET:          ~10-11 jours GPU + 1 jour dev
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SCRIPTS À CRÉER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Scripts existants (déjà créés):
+✅ download_ultra_filtered_mistral.py
+✅ pretrain_hessgpt_mistral.py
+✅ sft_hessgpt_mistral_lora.py
+✅ HessGpt.py (architecture)
+
+Scripts à créer:
+📝 merge_lora.py                    - Fusionner LoRA dans base model
+📝 download_code_dataset.py         - Download datasets code (The Stack, etc.)
+📝 config_model2.json               - Config pour Model 2 (0.3B)
+📝 sandbox.py                       - Python sandbox sécurisé
+📝 router.py                        - Router Model 1 ↔ Model 2
+📝 inference.py                     - Inference avec routing
+📝 generate_routing_dataset.py     - Helper pour générer 20k samples
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STRUCTURE FICHIERS FINALE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+HessGPT_Project/
+├── Core/
+│   └── Model/
+│       ├── HessGpt.py
+│       ├── attention.py
+│       ├── transformer_block.py
+│       └── feedforward.py
+│
+├── scripts/
+│   ├── download_ultra_filtered_mistral.py
+│   ├── download_code_dataset.py
+│   ├── pretrain_hessgpt_mistral.py
+│   ├── sft_hessgpt_mistral_lora.py
+│   ├── merge_lora.py
+│   ├── router.py
+│   ├── sandbox.py
+│   └── inference.py
+│
+├── configs/
+│   ├── model1_config.json          (0.5B factual)
+│   └── model2_config.json          (0.3B code)
+│
+├── data/
+│   ├── ultra_filtered/             (Model 1 pretrain)
+│   ├── code_filtered/              (Model 2 pretrain)
+│   ├── sft_conversational/         (Model 1 SFT #1)
+│   └── routing_dataset_20k.json    (Model 1 SFT #2)
+│
+├── checkpoints/
+│   ├── HessGpt_model1_final.pt     ✅ Model 1 final
+│   ├── HessGpt_model2_final.pt     ✅ Model 2 final
+│   └── [intermediate checkpoints]
+│
+├── requirements.txt
+├── ARCHITECTURE_OVERVIEW.txt
+└── TRAINING_ROADMAP.txt            (ce fichier)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+NOTES IMPORTANTES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+⚡ CRITIQUES:
+1. Dataset routing (20k samples) est ESSENTIEL
+   → Sans ça, Model 1 ne saura pas quand utiliser <|code|>
+
+2. Sandbox DOIT être sécurisé
+   → Timeout, limite mémoire, pas d'accès filesystem
+
+3. Model 2 doit être spécialisé code UNIQUEMENT
+   → Pas de data factuelle, sinon dilution
+
+4. Token <|code|> suffit (pas besoin de </code>)
+   → <|end|> sert de délimiteur
+
+
+✅ AVANTAGES:
+- Model 1 reste léger et rapide pour conversations
+- Model 2 expert en code/math
+- Exécution sandbox sécurisée
+- Coût total: ~10-11 jours GPU (acceptable)
+
+
+🎯 PRIORITÉS:
+1. Finir training Model 1 (Phase 1) - 5.7 jours
+2. Générer dataset routing 20k - 1-2 jours
+3. Créer sandbox + router - 1 jour
+4. Tester inference avec routing
+5. Si tout OK → Train Model 2 (Phase 2) - 4 jours
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                            Créé: Février 2025
+                        Auteur: HessGPT Project Team
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
