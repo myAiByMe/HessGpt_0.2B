@@ -134,8 +134,10 @@ def find_chunk(data_dir):
 
     chunk_name, chunk_path = candidates[0]
 
-    # Extrait l'ID numérique du nom (chunk000 → 0, chunk_3 → 3, chunk2 → 2)
-    chunk_id = int(''.join(filter(str.isdigit, chunk_name))) if any(c.isdigit() for c in chunk_name) else 0
+    # Extrait l'ID numérique du nom
+    # chunk000→0 | chunk_000→0 | chunk_3→3 | chunk2→2
+    digits = ''.join(filter(str.isdigit, chunk_name))
+    chunk_id = int(digits.lstrip('0') or '0') if digits else 0
 
     return chunk_path, chunk_id, chunk_name
 
@@ -324,7 +326,11 @@ if os.path.exists(CHECKPOINT_FILE):
     print(f"\n📂 Checkpoint trouvé → resume...")
     ckpt = torch.load(CHECKPOINT_FILE, map_location='cpu')
 
-    model.load_state_dict(ckpt['model_state_dict'])
+    # Fix torch.compile prefix _orig_mod.
+    state_dict = ckpt['model_state_dict']
+    if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+        state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
     model = model.to(device)
     optimizer.load_state_dict(ckpt['optimizer_state_dict'])
 
