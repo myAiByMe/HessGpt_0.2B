@@ -33,7 +33,7 @@ from HessGpt import HessGPT
 # ============================================
 # CONFIGURATION HARDCODÉE
 # ============================================
-NUM_CHUNKS = 5
+NUM_CHUNKS = 4  # 4 chunks pour test (1 epoch)
 DATA_DIR = './data/ultra_filtered'
 MODEL_DIR = './tinyModel'
 CHECKPOINT_FILE = f'{MODEL_DIR}/hessgpt_mini_pretrain.pt'
@@ -79,7 +79,7 @@ CONFIG = {
     'soft_cap':      30.0,
     'use_flash_attn': True,
 
-    'batch_size':              64,
+    'batch_size':              90,        # 64 → 90 (safe sweet spot)
     'gradient_accumulation':   4,
     'max_grad_norm':           1.0,
     'learning_rate':           5e-4,
