@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-🔥 HessGPT Mini 0.17B - PRETRAIN (MODAL OPTIMIZED - 1 EPOCH 4 CHUNKS IN RAM)
+🔥 HessGPT Mini 0.2B - PRETRAIN v3
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✅ Load 4 chunks en RAM
-✅ Train 1 epoch complet sur tous les chunks mélangés
-✅ Auto stop à 50min (safe swap time)
-✅ Checkpoint agressif tous les 45min
-✅ FIXED: Resume au bon step (batch tracking)
-✅ Batch=90 + Compile + Flash Attn
-✅ 170M params (test model)
+✅ NO CLI, NO EDIT — Lance direct
+✅ Chunk auto-détecté dans ./data/
+✅ Epoch/Step dans les métadonnées du .pt
+✅ Save auto toutes les 50 minutes
+✅ Multi-compte friendly
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Just run: python pretrain_mini_modal_1epoch.py
+Stratégie multi-compte :
+  1. Place ton chunk dans ./data/  (1 seul chunk à la fois)
+  2. Place le .pt dans ./tinyModel/ si tu reprends
+  3. Lance : python pretrain_mini_0.2B_v3.py
+  4. À la fin : download le .pt, change de compte, place chunk suivant + .pt, relance
 """
 
 import torch
@@ -32,49 +34,46 @@ sys.path.append('./Core/Model')
 from HessGpt import HessGPT
 
 # ============================================
-# CONFIGURATION HARDCODÉE
+# CONFIGURATION
 # ============================================
-NUM_CHUNKS = 4  # Load 4 chunks en RAM
-DATA_DIR = './data/ultra_filtered'
-MODEL_DIR = './tinyModel'
+DATA_DIR        = './data'
+MODEL_DIR       = './tinyModel'
 CHECKPOINT_FILE = f'{MODEL_DIR}/hessgpt_mini_pretrain.pt'
-
-# Modal-specific
-MAX_RUNTIME_MINUTES = 50
-CHECKPOINT_EVERY_MINUTES = 45
+TOTAL_CHUNKS    = 5
+SAVE_EVERY_MINUTES = 50
 
 # ============================================
-# TOKENS SPÉCIAUX
+# TOKENS SPÉCIAUX — Gold Standard 2026
 # ============================================
 SPECIAL_TOKENS = {
-    '<|system|>':      32000,
-    '<|user|>':        32001,
-    '<|assistant|>':   32002,
-    '<|end|>':         32003,
-    '<think>':         32004,
-    '</think>':        32005,
-    '<tool_call>':     32006,
-    '</tool_call>':    32007,
-    '<tool_response>': 32008,
-    '</tool_response>':32009,
-    '<code>':          32010,
+    '<|system|>':       32000,
+    '<|user|>':         32001,
+    '<|assistant|>':    32002,
+    '<|end|>':          32003,
+    '<think>':          32004,
+    '</think>':         32005,
+    '<tool_call>':      32006,
+    '</tool_call>':     32007,
+    '<tool_response>':  32008,
+    '</tool_response>': 32009,
+    '<code>':           32010,
 }
 
 # ============================================
-# CONFIG OPTIMISÉE POUR MODAL (170M - TEST)
+# CONFIG MINI 0.2B
 # ============================================
 CONFIG = {
     'vocab_size':    32011,
-    'embed_dim':     896,      # 170M model
+    'embed_dim':     896,
     'num_heads':     14,
     'n_kv_heads':    7,
     'num_layers':    16,
-    'max_seq_len':   512,       # Test mode - SFT will up-scale to 4096 via YaRN
+    'max_seq_len':   1024,
     'dropout':       0.0,
     'use_rope':      True,
     'use_yarn':      False,
     'yarn_scale':    1.0,
-    'yarn_original_max_len': 512,   # Match max_seq_len for proper YaRN calibration
+    'yarn_original_max_len': 1024,
     'use_swiglu':    True,
     'use_qk_norm':   True,
     'soft_cap':      30.0,
@@ -83,7 +82,7 @@ CONFIG = {
     'batch_size':              90,
     'gradient_accumulation':   4,
     'max_grad_norm':           1.0,
-    'learning_rate':           5e-4,
+    'learning_rate':           8e-4,
     'weight_decay':            0.1,
     'adam_beta1':              0.9,
     'adam_beta2':              0.95,
@@ -93,124 +92,69 @@ CONFIG = {
     'decay_ratio':   0.15,
     'min_lr_ratio':  0.1,
 
-    'validate_every_steps': 1000,
-    'val_batches':          20,
-
-    'use_compile':    True,
-    'compile_mode':   'default',
+    'use_compile':   True,
+    'compile_mode':  'default',
 }
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-print("=" * 80)
-print("🔥 HessGPT Mini 0.17B — PRETRAIN (1 EPOCH 4 CHUNKS IN RAM)")
-print(f"   Data:       {DATA_DIR}")
-print(f"   Model:      {MODEL_DIR}")
-print(f"   Hardware:   H100 + 4CPU")
-print(f"   Max time:   {MAX_RUNTIME_MINUTES}min (stop pour swap)")
-print(f"   Checkpoint: {CHECKPOINT_EVERY_MINUTES}min")
-print(f"   Mode:       Load all {NUM_CHUNKS} chunks → train 1 epoch")
-print("=" * 80)
-
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 # ============================================
-# TOKENIZER
+# AUTO-DETECT CHUNK
 # ============================================
-print(f"\n📝 Loading Mistral tokenizer...")
-tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
-tokenizer.add_special_tokens({
-    'additional_special_tokens': list(SPECIAL_TOKENS.keys())
-})
-tokenizer.pad_token = tokenizer.eos_token
-print(f"   ✅ Vocab: {len(tokenizer)}")
+def find_chunk(data_dir):
+    """
+    Cherche le premier (et unique) dossier chunk dans ./data/
+    Accepte : chunk000, chunk001, chunk_0, chunk_1, etc.
+    """
+    if not os.path.exists(data_dir):
+        raise FileNotFoundError(f"❌ Dossier data introuvable: {data_dir}")
 
-# ============================================
-# MODEL
-# ============================================
-print(f"\n🏗️  Creating model...")
-model = HessGPT(
-    vocab_size=CONFIG['vocab_size'],
-    embed_dim=CONFIG['embed_dim'],
-    num_heads=CONFIG['num_heads'],
-    num_layers=CONFIG['num_layers'],
-    max_seq_len=CONFIG['max_seq_len'],
-    dropout=CONFIG['dropout'],
-    use_rope=CONFIG['use_rope'],
-    use_yarn=CONFIG['use_yarn'],
-    yarn_scale=CONFIG['yarn_scale'],
-    yarn_original_max_len=CONFIG['yarn_original_max_len'],
-    use_swiglu=CONFIG['use_swiglu'],
-    n_kv_heads=CONFIG['n_kv_heads'],
-    use_qk_norm=CONFIG['use_qk_norm'],
-    soft_cap=CONFIG['soft_cap'],
-    use_flash_attn=CONFIG['use_flash_attn']
-).to(device)
-
-params = model.count_parameters()
-print(f"   ✅ {params['total']/1e6:.1f}M params")
-
-if CONFIG['use_compile'] and device == 'cuda':
-    print(f"\n⚡ torch.compile...")
-    try:
-        model = torch.compile(model, mode=CONFIG['compile_mode'])
-        print(f"   ✅ Compiled")
-    except Exception as e:
-        print(f"   ⚠️  Compile failed: {e}")
-
-# ============================================
-# SCAN CHUNKS
-# ============================================
-def scan_chunks(data_dir):
-    chunks = []
+    candidates = []
     for entry in sorted(os.listdir(data_dir)):
-        if not entry.startswith('chunk'):
+        full_path = os.path.join(data_dir, entry)
+        if not os.path.isdir(full_path):
             continue
-        chunk_dir = os.path.join(data_dir, entry)
-        if not os.path.isdir(chunk_dir):
+        if not entry.lower().startswith('chunk'):
             continue
-        stats_file = os.path.join(chunk_dir, 'stats.json')
-        if not os.path.exists(stats_file):
+        # Vérifie qu'il contient des .npy
+        npy_files = [f for f in os.listdir(full_path) if f.endswith('.npy')]
+        if len(npy_files) == 0:
             continue
-        with open(stats_file, 'r') as f:
-            stats = json.load(f)
-        chunks.append({
-            'id': stats['chunk_id'],
-            'dir': chunk_dir,
-            'stats': stats
-        })
-    return sorted(chunks, key=lambda x: x['id'])
+        candidates.append((entry, full_path))
 
-chunks = scan_chunks(DATA_DIR)[:NUM_CHUNKS]
-print(f"\n📦 Found {len(chunks)} chunks")
+    if len(candidates) == 0:
+        raise FileNotFoundError(
+            f"❌ Aucun dossier chunk avec des .npy trouvé dans {data_dir}\n"
+            f"   Place ton chunk dans {data_dir}/chunk000/ par exemple"
+        )
+
+    if len(candidates) > 1:
+        print(f"   ⚠️  Plusieurs chunks trouvés, on prend le premier: {candidates[0][0]}")
+
+    chunk_name, chunk_path = candidates[0]
+
+    # Extrait l'ID numérique du nom (chunk000 → 0, chunk_3 → 3, chunk2 → 2)
+    chunk_id = int(''.join(filter(str.isdigit, chunk_name))) if any(c.isdigit() for c in chunk_name) else 0
+
+    return chunk_path, chunk_id, chunk_name
+
 
 # ============================================
-# DATASET (Combined all chunks)
+# DATASET
 # ============================================
-class CombinedDataset(Dataset):
-    def __init__(self, chunks_dirs, seq_len, pad_token_id):
+class ChunkDataset(Dataset):
+    def __init__(self, chunk_dir, seq_len):
         self.seq_len = seq_len
-        self.pad_token_id = pad_token_id
 
-        print(f"\n📚 Loading {len(chunks_dirs)} chunks into RAM...")
-        
+        files = sorted([f for f in os.listdir(chunk_dir) if f.endswith('.npy')])
         all_tokens = []
-        for i, chunk_dir in enumerate(chunks_dirs):
-            files = sorted([f for f in os.listdir(chunk_dir) if f.endswith('.npy')])
-            
-            chunk_tokens = []
-            for f in files:
-                path = os.path.join(chunk_dir, f)
-                tokens = np.load(path)
-                chunk_tokens.append(tokens)
-            
-            tokens = np.concatenate(chunk_tokens)
+        for f in files:
+            tokens = np.load(os.path.join(chunk_dir, f))
             all_tokens.append(tokens)
-            print(f"   ✅ Chunk {i+1}: {len(tokens)/1e6:.1f}M tokens")
-        
+
         self.tokens = np.concatenate(all_tokens)
         self.num_samples = len(self.tokens) // (seq_len + 1)
-        print(f"   📊 Total: {len(self.tokens)/1e9:.2f}B tokens | {self.num_samples:,} samples")
 
     def __len__(self):
         return self.num_samples
@@ -218,14 +162,13 @@ class CombinedDataset(Dataset):
     def __getitem__(self, idx):
         start = idx * (self.seq_len + 1)
         chunk = self.tokens[start : start + self.seq_len + 1]
-
         x = torch.from_numpy(chunk[:-1].copy()).long()
         y = torch.from_numpy(chunk[1:].copy()).long()
-
         return x, y
 
+
 # ============================================
-# SCHEDULER (WSD — Warmup Stable Decay)
+# SCHEDULER WSD
 # ============================================
 class WSDScheduler:
     def __init__(self, optimizer, max_lr, total_steps, warmup_ratio, decay_ratio, min_lr_ratio):
@@ -260,52 +203,107 @@ class WSDScheduler:
     def get_last_lr(self):
         return [self.get_lr()]
 
-# ============================================
-# CHECKPOINT RESUME (FIXED)
-# ============================================
-global_step = 0
-resume_checkpoint = None
-start_batch = 0
-
-if os.path.exists(CHECKPOINT_FILE):
-    print(f"\n📂 Found checkpoint, resuming...")
-    resume_checkpoint = torch.load(CHECKPOINT_FILE, map_location='cpu')
-    model.load_state_dict(resume_checkpoint['model_state_dict'])
-    
-    global_step = resume_checkpoint.get('global_step', 0)
-    start_batch = resume_checkpoint.get('batch_in_epoch', 0)
-    
-    print(f"   ✅ Global steps: {global_step:,}")
-    print(f"   ✅ Start batch: {start_batch}")
-    model = model.to(device)
-else:
-    print(f"\n🆕 Starting fresh")
 
 # ============================================
-# TRAINING
+# SAVE
 # ============================================
-print(f"\n🚀 Training start...")
+def save_checkpoint(model, optimizer, scheduler,
+                    global_step, step_in_epoch, epoch,
+                    chunk_id, batch_idx, loss_val):
+    torch.save({
+        'model_state_dict':     model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': {'current_step': scheduler.current_step},
 
-# Load all chunks into RAM
-chunk_dirs = [chunk['dir'] for chunk in chunks]
-dataset = CombinedDataset(chunk_dirs, CONFIG['max_seq_len'], tokenizer.pad_token_id)
+        # ── Métadonnées human-readable ──
+        'epoch':            epoch,           # 1-indexed (epoch 1 = chunk 0)
+        'step_in_epoch':    step_in_epoch,   # steps depuis le début de ce chunk
+        'global_step':      global_step,     # steps cumulés tous chunks
 
-# Estimate total steps
-total_samples = len(dataset)
-batches = math.ceil(total_samples / CONFIG['batch_size'])
-total_steps = math.ceil(batches / CONFIG['gradient_accumulation'])
-print(f"   Total steps (1 epoch): {total_steps:,}")
+        # ── Pour le resume ──
+        'completed_chunk_id': chunk_id,      # chunk en cours ou terminé
+        'batch_idx_in_chunk': batch_idx,     # -1 si chunk terminé
 
-# DataLoader
-loader = DataLoader(
-    dataset,
-    batch_size=CONFIG['batch_size'],
-    shuffle=True,
-    num_workers=4,
-    pin_memory=True
+        # ── Meta ──
+        'config':           CONFIG,
+        'tokenizer':        'mistralai/Mistral-7B-v0.1',
+        'special_tokens':   SPECIAL_TOKENS,
+        'saved_at':         datetime.now().isoformat(),
+        'last_loss':        loss_val,
+    }, CHECKPOINT_FILE)
+
+    status = "chunk terminé" if batch_idx == -1 else f"batch {batch_idx}"
+    print(f"\n   💾 Save  |  epoch={epoch}  step={step_in_epoch}  global={global_step:,}  loss={loss_val:.4f}  ({status})")
+    print(f"      → {CHECKPOINT_FILE}")
+
+
+# ============================================
+# DETECT CHUNK
+# ============================================
+print("\n🔍 Détection du chunk...")
+chunk_path, chunk_id, chunk_name = find_chunk(DATA_DIR)
+epoch = chunk_id + 1   # epoch 1-indexed
+
+print(f"   ✅ Chunk trouvé : {chunk_name}  →  epoch {epoch} / {TOTAL_CHUNKS}")
+print(f"   Path: {chunk_path}")
+
+print("=" * 80)
+print("🔥 HessGPT Mini 0.2B — PRETRAIN v3")
+print(f"   Epoch:  {epoch} / {TOTAL_CHUNKS}  (chunk {chunk_name})")
+print(f"   Model:  {MODEL_DIR}")
+print(f"   Save:   toutes les {SAVE_EVERY_MINUTES} min")
+print("=" * 80)
+
+# ============================================
+# TOKENIZER
+# ============================================
+print(f"\n📝 Loading tokenizer...")
+tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
+tokenizer.add_special_tokens({'additional_special_tokens': list(SPECIAL_TOKENS.keys())})
+tokenizer.pad_token = tokenizer.eos_token
+print(f"   ✅ Vocab: {len(tokenizer)}")
+
+# ============================================
+# MODEL
+# ============================================
+print(f"\n🏗️  Creating model...")
+model = HessGPT(
+    vocab_size=CONFIG['vocab_size'],
+    embed_dim=CONFIG['embed_dim'],
+    num_heads=CONFIG['num_heads'],
+    num_layers=CONFIG['num_layers'],
+    max_seq_len=CONFIG['max_seq_len'],
+    dropout=CONFIG['dropout'],
+    use_rope=CONFIG['use_rope'],
+    use_yarn=CONFIG['use_yarn'],
+    yarn_scale=CONFIG['yarn_scale'],
+    yarn_original_max_len=CONFIG['yarn_original_max_len'],
+    use_swiglu=CONFIG['use_swiglu'],
+    n_kv_heads=CONFIG['n_kv_heads'],
+    use_qk_norm=CONFIG['use_qk_norm'],
+    soft_cap=CONFIG['soft_cap'],
+    use_flash_attn=CONFIG['use_flash_attn']
+).to(device)
+
+params = model.count_parameters()
+print(f"   ✅ {params['total']/1e6:.1f}M params")
+
+# ============================================
+# DATASET + STEPS ESTIMATION
+# ============================================
+print(f"\n📦 Chargement dataset...")
+dataset = ChunkDataset(chunk_path, CONFIG['max_seq_len'])
+print(f"   ✅ {len(dataset):,} samples")
+
+steps_per_chunk = math.ceil(
+    math.ceil(len(dataset) / CONFIG['batch_size']) / CONFIG['gradient_accumulation']
 )
+total_steps = steps_per_chunk * TOTAL_CHUNKS
+print(f"   Steps/chunk: {steps_per_chunk:,}  |  Total estimé: {total_steps:,}")
 
-# Optimizer
+# ============================================
+# OPTIMIZER
+# ============================================
 optimizer = torch.optim.AdamW(
     model.parameters(),
     lr=CONFIG['learning_rate'],
@@ -314,10 +312,51 @@ optimizer = torch.optim.AdamW(
     eps=CONFIG['adam_eps']
 )
 
-if resume_checkpoint is not None and 'optimizer_state_dict' in resume_checkpoint:
-    optimizer.load_state_dict(resume_checkpoint['optimizer_state_dict'])
+# ============================================
+# CHECKPOINT RESUME
+# ============================================
+global_step    = 0
+step_in_epoch  = 0
+resume_batch   = -1
+current_loss   = 0.0
 
-# Scheduler
+if os.path.exists(CHECKPOINT_FILE):
+    print(f"\n📂 Checkpoint trouvé → resume...")
+    ckpt = torch.load(CHECKPOINT_FILE, map_location='cpu')
+
+    model.load_state_dict(ckpt['model_state_dict'])
+    model = model.to(device)
+    optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+
+    global_step   = ckpt.get('global_step', 0)
+    current_loss  = ckpt.get('last_loss', 0.0)
+    saved_chunk   = ckpt.get('completed_chunk_id', -1)
+    saved_epoch   = ckpt.get('epoch', 0)
+    saved_step    = ckpt.get('step_in_epoch', 0)
+    saved_at      = ckpt.get('saved_at', 'unknown')
+
+    print(f"   Sauvegardé le : {saved_at}")
+    print(f"   Checkpoint    : epoch {saved_epoch}  step {saved_step}  global {global_step:,}")
+    print(f"   Ce run        : epoch {epoch}")
+
+    if saved_chunk == chunk_id:
+        # Même chunk → reprise mid-epoch
+        resume_batch  = ckpt.get('batch_idx_in_chunk', -1)
+        step_in_epoch = ckpt.get('step_in_epoch', 0)
+        print(f"   ⚡ Même chunk → reprise au batch {resume_batch}  (step_in_epoch={step_in_epoch})")
+    else:
+        # Nouveau chunk → epoch suivante, step_in_epoch repart à 0
+        step_in_epoch = 0
+        resume_batch  = -1
+        print(f"   🆕 Nouveau chunk → step_in_epoch repart à 0, scheduler continue (global={global_step:,})")
+
+else:
+    print(f"\n🆕 Aucun checkpoint, démarrage fresh")
+    model = model.to(device)
+
+# ============================================
+# SCHEDULER — positionné au bon global_step
+# ============================================
 scheduler = WSDScheduler(
     optimizer,
     max_lr=CONFIG['learning_rate'],
@@ -326,122 +365,134 @@ scheduler = WSDScheduler(
     decay_ratio=CONFIG['decay_ratio'],
     min_lr_ratio=CONFIG['min_lr_ratio']
 )
+scheduler.current_step = global_step
+print(f"\n   LR actuel : {scheduler.get_lr():.2e}  (step {scheduler.current_step}/{total_steps})")
 
-if resume_checkpoint is not None and 'scheduler_state_dict' in resume_checkpoint:
-    scheduler.current_step = resume_checkpoint['scheduler_state_dict'].get('current_step', 0)
+# ============================================
+# COMPILE
+# ============================================
+if CONFIG['use_compile'] and device == 'cuda':
+    print(f"\n⚡ torch.compile...")
+    try:
+        model = torch.compile(model, mode=CONFIG['compile_mode'])
+        print(f"   ✅ OK")
+    except Exception as e:
+        print(f"   ⚠️  Échec: {e}")
 
-# ── Training loop with Modal timeout ────────────────────────────────────────
-model.train()
-start_time = time.time()
-last_checkpoint_time = start_time
-timeout_seconds = MAX_RUNTIME_MINUTES * 60
-checkpoint_interval_seconds = CHECKPOINT_EVERY_MINUTES * 60
+# ============================================
+# DATALOADER
+# ============================================
+loader = DataLoader(
+    dataset,
+    batch_size=CONFIG['batch_size'],
+    shuffle=True,
+    num_workers=min(4, os.cpu_count()),
+    pin_memory=True
+)
 
-def should_stop():
-    elapsed = time.time() - start_time
-    return elapsed > timeout_seconds
-
-def should_checkpoint():
-    elapsed = time.time() - last_checkpoint_time
-    return elapsed > checkpoint_interval_seconds
-
+# ============================================
+# TRAINING
+# ============================================
 print(f"\n{'='*70}")
-print(f"EPOCH 1 / 1 (4 chunks mixed)")
+print(f"🚀 TRAINING  |  epoch {epoch}/{TOTAL_CHUNKS}  |  {len(dataset):,} samples")
 print(f"{'='*70}")
 
-pbar = tqdm(loader, desc="Epoch 1")
+model.train()
+last_save_time = time.time()
+save_interval  = SAVE_EVERY_MINUTES * 60
+
+pbar = tqdm(loader, desc=f"Epoch {epoch}")
 
 for batch_idx, (x, y) in enumerate(pbar):
-    
-    # ✅ FIX: Skip batches si resume en cours
-    if batch_idx < start_batch:
-        continue
-    
-    # Modal timeout check
-    if should_stop():
-        print(f"\n⏰ TIMEOUT APPROACHING ({MAX_RUNTIME_MINUTES}min) - Saving and exiting")
-        print(f"\n   💾 Emergency checkpoint...")
-        torch.save({
-            'model_state_dict':     model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': {'current_step': scheduler.current_step},
-            'config':               CONFIG,
-            'global_step':          global_step,
-            'batch_in_epoch':       batch_idx,  # ✅ FIX: Save batch offset
-            'tokenizer':            'mistralai/Mistral-7B-v0.1',
-            'special_tokens':       SPECIAL_TOKENS,
-        }, CHECKPOINT_FILE)
-        print(f"   ✅ Saved - Ready for next account")
-        sys.exit(0)
 
-    x = x.to(device)
-    y = y.to(device)
+    # ── Skip batches déjà vus (resume mid-chunk) ─────────────────────────
+    if resume_batch > 0 and batch_idx < resume_batch:
+        if batch_idx % 500 == 0:
+            print(f"\r   ⏭️  Skip {batch_idx}/{resume_batch}...", end='', flush=True)
+        continue
+    if resume_batch > 0 and batch_idx == resume_batch:
+        print(f"\n   ✅ Reprise effective au batch {batch_idx}")
+        resume_batch = -1
+
+    # ── Forward ──────────────────────────────────────────────────────────
+    x = x.to(device, non_blocking=True)
+    y = y.to(device, non_blocking=True)
 
     with torch.amp.autocast('cuda', dtype=torch.bfloat16):
         logits, loss = model(x, targets=y, pad_token_id=tokenizer.pad_token_id)
         loss = loss / CONFIG['gradient_accumulation']
 
     if torch.isnan(loss) or torch.isinf(loss):
+        print(f"\n   ⚠️  NaN/Inf batch {batch_idx}, skip")
         optimizer.zero_grad(set_to_none=True)
         continue
 
     loss.backward()
 
+    # ── Optimizer step ────────────────────────────────────────────────────
     if (batch_idx + 1) % CONFIG['gradient_accumulation'] == 0:
         torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG['max_grad_norm'])
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         scheduler.step()
-        global_step += 1
+
+        global_step   += 1
+        step_in_epoch += 1
+        current_loss   = loss.item() * CONFIG['gradient_accumulation']
 
         pbar.set_postfix({
-            'loss': f'{loss.item() * CONFIG["gradient_accumulation"]:.4f}',
-            'lr':   f'{scheduler.get_last_lr()[0]:.2e}',
-            'time': f'{(time.time() - start_time)/60:.1f}min'
+            'loss':   f'{current_loss:.4f}',
+            'lr':     f'{scheduler.get_last_lr()[0]:.2e}',
+            'ep_stp': f'{step_in_epoch}',
+            'g_stp':  f'{global_step:,}'
         })
 
-    # Periodic checkpoint (not emergency)
-    if should_checkpoint():
-        print(f"\n   💾 Periodic checkpoint at {(time.time() - start_time)/60:.1f}min...")
-        torch.save({
-            'model_state_dict':     model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': {'current_step': scheduler.current_step},
-            'config':               CONFIG,
-            'global_step':          global_step,
-            'batch_in_epoch':       batch_idx,  # ✅ FIX: Save batch offset
-            'tokenizer':            'mistralai/Mistral-7B-v0.1',
-            'special_tokens':       SPECIAL_TOKENS,
-        }, CHECKPOINT_FILE)
-        print(f"   ✅ Checkpoint saved")
-        last_checkpoint_time = time.time()
+    # ── Auto-save toutes les N minutes ───────────────────────────────────
+    if time.time() - last_save_time >= save_interval:
+        save_checkpoint(model, optimizer, scheduler,
+                        global_step, step_in_epoch, epoch,
+                        chunk_id, batch_idx, current_loss)
+        last_save_time = time.time()
 
-pbar.close()
-
+# ============================================
+# FIN DU CHUNK → save avec step_in_epoch=0
+# (prêt pour la prochaine epoch)
+# ============================================
 gc.collect()
 torch.cuda.empty_cache()
 
-# ============================================
-# FINAL
-# ============================================
-print(f"\n💾 Saving final checkpoint...")
-torch.save({
-    'model_state_dict':     model.state_dict(),
-    'optimizer_state_dict': optimizer.state_dict(),
-    'scheduler_state_dict': {'current_step': scheduler.current_step},
-    'config':               CONFIG,
-    'global_step':          global_step,
-    'batch_in_epoch':       0,  # Reset for next epoch if needed
-    'tokenizer':            'mistralai/Mistral-7B-v0.1',
-    'special_tokens':       SPECIAL_TOKENS,
-}, CHECKPOINT_FILE)
-print(f"   ✅ Saved: {CHECKPOINT_FILE}")
+print(f"\n\n{'='*70}")
+print(f"✅ Epoch {epoch} terminée !")
 
+# On sauvegarde avec batch_idx=-1 et step_in_epoch=0
+# → la prochaine session détectera chunk_id+1 et repartira proprement
+save_checkpoint(model, optimizer, scheduler,
+                global_step, 0, epoch,
+                chunk_id, -1, current_loss)
+
+# ============================================
+# RÉSUMÉ + INSTRUCTIONS
+# ============================================
 print(f"\n{'='*70}")
-print(f"✅ EPOCH 1 COMPLETED")
+print(f"📊 RÉSUMÉ")
 print(f"{'='*70}")
-print(f"\n   Model:       {params['total']/1e6:.1f}M params")
-print(f"   Chunks:      {NUM_CHUNKS}")
-print(f"   Steps:       {global_step:,}")
-print(f"   Total time:  {(time.time() - start_time)/3600:.2f}h")
+print(f"   Epoch:       {epoch} / {TOTAL_CHUNKS}")
+print(f"   Global step: {global_step:,}")
+print(f"   Last loss:   {current_loss:.4f}")
 print(f"   Checkpoint:  {CHECKPOINT_FILE}")
+
+next_epoch = epoch + 1
+next_chunk_id = chunk_id + 1
+if next_chunk_id < TOTAL_CHUNKS:
+    print(f"\n{'='*70}")
+    print(f"📋 PROCHAINE SESSION (epoch {next_epoch})")
+    print(f"{'='*70}")
+    print(f"   1. Download : {CHECKPOINT_FILE}")
+    print(f"   2. Change de compte / machine")
+    print(f"   3. Upload   : chunk{next_chunk_id:03d}/  dans ./data/")
+    print(f"   4. Upload   : hessgpt_mini_pretrain.pt  dans ./tinyModel/")
+    print(f"   5. Lance    : python pretrain_mini_0.2B_v3.py")
+    print(f"   → Le script détectera automatiquement chunk{next_chunk_id:03d} = epoch {next_epoch}")
+else:
+    print(f"\n   🎉 TOUS LES CHUNKS TERMINÉS → Lance le SFT !")
+    print(f"   python sft_lora_function_calling.py")
