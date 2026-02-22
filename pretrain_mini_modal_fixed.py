@@ -80,10 +80,10 @@ CONFIG = {
     'soft_cap':      30.0,
     'use_flash_attn': True,
 
-    'batch_size':              192,
+    'batch_size':              90,
     'gradient_accumulation':   4,
     'max_grad_norm':           1.0,
-    'learning_rate':           5.5e-4,
+    'learning_rate':           5e-4,
     'weight_decay':            0.1,
     'adam_beta1':              0.9,
     'adam_beta2':              0.95,
