@@ -79,7 +79,7 @@ CONFIG = {
     'soft_cap':      30.0,
     'use_flash_attn': True,
 
-    'batch_size':              65,
+    'batch_size':              70,
     'gradient_accumulation':   4,
     'max_grad_norm':           1.0,
     'learning_rate':           8e-4,
