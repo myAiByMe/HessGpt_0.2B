@@ -180,11 +180,23 @@ class CosineScheduler:
 
 
 # ============================================
+# PPL helper
+# ============================================
+def ppl_from_loss(loss_val):
+    """Perplexité = exp(loss). Clamp pour éviter overflow."""
+    try:
+        return math.exp(min(loss_val, 20))  # exp(20) ≈ 485M, au-delà c'est inf
+    except OverflowError:
+        return float('inf')
+
+
+# ============================================
 # SAVE
 # ============================================
 def save_checkpoint(model, optimizer, scheduler,
                     global_step, step_in_epoch,
                     batch_idx, loss_val, path):
+    ppl = ppl_from_loss(loss_val)
     torch.save({
         'model_state_dict':     model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
@@ -200,11 +212,12 @@ def save_checkpoint(model, optimizer, scheduler,
         'special_tokens':    SPECIAL_TOKENS,
         'saved_at':          datetime.now().isoformat(),
         'last_loss':         loss_val,
+        'last_ppl':          ppl,                          # ✅ PPL sauvegardée
         'injection_type':    'math_finemath_nemotron',
     }, path)
 
     status = "terminé" if batch_idx == -1 else f"batch {batch_idx}"
-    print(f"\n   💾 Save  |  step={step_in_epoch}  global={global_step:,}  loss={loss_val:.4f}  ({status})")
+    print(f"\n   💾 Save  |  step={step_in_epoch}  global={global_step:,}  loss={loss_val:.4f}  ppl={ppl:.1f}  ({status})")
     print(f"      → {path}")
 
 
@@ -256,7 +269,8 @@ model = model.to(device)
 pretrain_epoch = ckpt.get('epoch', '?')
 pretrain_loss  = ckpt.get('last_loss', '?')
 pretrain_step  = ckpt.get('global_step', 0)
-print(f"   ✅ Pretrain epoch={pretrain_epoch} | loss={pretrain_loss:.4f} | global_step={pretrain_step:,}")
+pretrain_ppl   = ppl_from_loss(pretrain_loss) if isinstance(pretrain_loss, float) else '?'
+print(f"   ✅ Pretrain epoch={pretrain_epoch} | loss={pretrain_loss:.4f} | ppl={pretrain_ppl:.1f} | global_step={pretrain_step:,}")
 
 # ============================================
 # DATASET
@@ -312,9 +326,10 @@ if os.path.exists(OUTPUT_CKPT):
     step_in_epoch = inj_ckpt.get('step_in_epoch', 0)
     resume_batch  = inj_ckpt.get('batch_idx', -1)
     current_loss  = inj_ckpt.get('last_loss', 0.0)
+    resume_ppl    = ppl_from_loss(current_loss)
 
     print(f"   Sauvegardé le : {inj_ckpt.get('saved_at', '?')}")
-    print(f"   Step: {step_in_epoch} | Global: {global_step:,} | Loss: {current_loss:.4f}")
+    print(f"   Step: {step_in_epoch} | Global: {global_step:,} | Loss: {current_loss:.4f} | PPL: {resume_ppl:.1f}")
     print(f"   ⚡ Reprise au batch {resume_batch}")
 else:
     print(f"\n🆕 Démarrage injection fresh")
@@ -353,6 +368,10 @@ print(f"{'='*70}")
 model.train()
 last_save_time = time.time()
 save_interval  = SAVE_EVERY_MINUTES * 60
+
+# ── Moyenne glissante PPL sur les 50 derniers steps ──────────────────
+ppl_window = []
+PPL_WINDOW_SIZE = 50
 
 pbar = tqdm(loader, desc="Math Injection")
 
@@ -393,8 +412,17 @@ for batch_idx, (x, y) in enumerate(pbar):
         step_in_epoch += 1
         current_loss   = loss.item() * CONFIG['gradient_accumulation']
 
+        # ── PPL instantanée + moyenne glissante ──────────────────────
+        current_ppl = ppl_from_loss(current_loss)
+        ppl_window.append(current_ppl)
+        if len(ppl_window) > PPL_WINDOW_SIZE:
+            ppl_window.pop(0)
+        avg_ppl = sum(ppl_window) / len(ppl_window)
+
         pbar.set_postfix({
             'loss': f'{current_loss:.4f}',
+            'ppl':  f'{current_ppl:.1f}',          # ✅ PPL instantanée
+            'ppl50':f'{avg_ppl:.1f}',               # ✅ PPL moyenne glissante 50 steps
             'lr':   f'{scheduler.get_last_lr()[0]:.2e}',
             'step': f'{step_in_epoch}/{total_steps}',
         })
@@ -412,6 +440,8 @@ for batch_idx, (x, y) in enumerate(pbar):
 gc.collect()
 torch.cuda.empty_cache()
 
+final_ppl = ppl_from_loss(current_loss)
+
 print(f"\n\n{'='*70}")
 print(f"✅ MATH INJECTION TERMINÉE !")
 
@@ -424,6 +454,7 @@ print(f"📊 RÉSUMÉ")
 print(f"{'='*70}")
 print(f"   Steps:       {step_in_epoch:,}")
 print(f"   Last loss:   {current_loss:.4f}")
+print(f"   Last PPL:    {final_ppl:.1f}")          # ✅ PPL finale
 print(f"   Checkpoint:  {OUTPUT_CKPT}")
 print(f"\n{'='*70}")
 print(f"📋 PROCHAINE ÉTAPE")
