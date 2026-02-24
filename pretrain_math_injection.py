@@ -88,7 +88,7 @@ CONFIG = {
     'max_grad_norm':           1.0,
 
     # LR très bas — on affine, on ne réapprend pas
-    'learning_rate':           5e-5,
+    'learning_rate':           3e-7,
     'weight_decay':            0.1,
     'adam_beta1':              0.9,
     'adam_beta2':              0.95,
